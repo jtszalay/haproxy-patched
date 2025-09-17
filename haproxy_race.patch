@@ -1,0 +1,71 @@
+Commit ID: 0f040d79ef61b1a3ccf59f4fc123678fcf5c6e32
+Change ID: vnstwpkwkyltnvrwkxkqpkwwnurmrtks
+Author: Josh Robson Chase <josh@robsonchase.com> (2024-01-18 13:53 -05:00)
+Committer: Josh Robson Chase <josh@robsonchase.com> (2024-01-18 13:53 -05:00)
+
+    BUG/MEDIUM: Fix race condition between listener_accept and manage_proxy
+
+    Almost identical to 13e86d9 (BUG/MEDIUM: listener: Fix race condition
+    when updating the global mngmt task). When multiple `listener_accept`
+    threads attempt to schedule the proxy task which calls `manage_proxy`,
+    one listener thread may be sufficiently delayed to cause a race between
+    its call to `task_schedule` and `manage_proxy`'s clearing of the
+    `expire` field. This only occurs when `rate-limit sessions` is set and
+    the server is sufficiently loaded to cause the thread scheduling issues
+    resulting in the listener task delay. This results in the following
+    `BUG_ON` in the listener task:
+
+        FATAL: bug condition "task->expire == 0" matched at src/task.c:285
+          call trace(11):
+          |       0x56eb28 [0f 0b 66 0f 1f 44 00 00]: __task_queue+0xc8/0xca
+          |       0x553903 [eb 9c 0f 1f 00 ba 03 00]: main+0x1317e3
+          |       0x556de6 [8b 54 24 18 85 d2 0f 84]:
+    listener_accept+0x12c6/0x14f6
+          |       0x5ac348 [4d 8b 3c 24 49 01 df 64]:
+    fd_update_events+0x1a8/0x4a8
+          |       0x427d58 [48 39 eb 74 3b 66 66 66]: main+0x5c38
+          |       0x53801f [64 48 8b 04 25 00 00 00]: run_poll_loop+0x10f/0x647
+          |       0x5387f5 [49 c7 c4 c0 47 6a 00 49]: main+0x1166d5
+          | 0x7f7f662b4333 [e9 74 fe ff ff 48 8b 44]: libc:+0x8b333
+          | 0x7f7f66336efc [48 89 c7 b8 3c 00 00 00]: libc:+0x10defc
+
+    To fix it, we wrap the call to `task_schedule` in `listener_accept` and
+    the setting of `task->expire` in `manage_proxy` with the proxy's RW
+    lock. The same semantics are used as in 13e86d9. The `task_schedule`
+    call is read locked and the setting of `expire` to maybe-ETERNITY
+    is write locked.
+
+    This will fix issue #2289. It must be backported to 2.4 onward, and
+    should apply cleanly as the relevant code hasn't changed since then.
+
+diff --git a/src/listener.c b/src/listener.c
+index 339dac7904...307e0824ce 100644
+--- a/src/listener.c
++++ b/src/listener.c
+@@ -1570,7 +1570,11 @@
+ 	 */
+ 	limit_listener(l, &p->listener_queue);
+ 	if (p->task && tick_isset(expire))
++	{
++		HA_RWLOCK_RDLOCK(PROXY_LOCK, &p->lock);
+ 		task_schedule(p->task, expire);
++		HA_RWLOCK_RDUNLOCK(PROXY_LOCK, &p->lock);
++	}
+ 	goto end;
+ }
+ 
+diff --git a/src/proxy.c b/src/proxy.c
+index bedd57a2b2...bf2e33d0a9 100644
+--- a/src/proxy.c
++++ b/src/proxy.c
+@@ -2100,7 +2100,9 @@
+ 	/* The proxy is not limited so we can re-enable any waiting listener */
+ 	dequeue_proxy_listeners(p);
+  out:
++	HA_RWLOCK_WRLOCK(PROXY_LOCK, &p->lock);
+ 	t->expire = next;
++	HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &p->lock);
+ 	task_queue(t);
+ 	return t;
+ }
+-
